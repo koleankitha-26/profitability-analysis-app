@@ -12,6 +12,7 @@ import type { User } from '@supabase/supabase-js'
 import { supabase, supabaseConfigMessage } from './lib/supabase'
 import { calculateProfitability, type Analysis, type AnalysisInput } from './utils/profitability'
 import BulkUpload from './components/BulkUpload'
+import ProfilePhotoEditor, { CIRCULAR_CROP_MIN_ZOOM } from './components/ProfilePhotoEditor'
 
 type Profile = {
   fullName: string
@@ -133,6 +134,7 @@ function getGoogleIdentity(user: User): GoogleIdentity | null {
 }
 
 function App() {
+  const [isLoggedOut, setIsLoggedOut] = useState(() => loadStored('profitability-logged-out', false))
   const [profile, setProfile] = useState<Profile | null>(() => loadStored('profitability-profile', null))
   const [analyses, setAnalyses] = useState<Analysis[]>(() => loadStored('profitability-analyses', []))
   const [settings, setSettings] = useState<Settings>(() => loadStored('profitability-settings', { darkMode: false }))
@@ -195,7 +197,8 @@ function App() {
   useEffect(() => {
     try {
       if (profile) localStorage.setItem('profitability-profile', JSON.stringify(profile))
-      else localStorage.removeItem('profitability-profile')
+      else if (!isLoggedOut) localStorage.removeItem('profitability-profile')
+      localStorage.setItem('profitability-logged-out', JSON.stringify(isLoggedOut))
       localStorage.setItem('profitability-analyses', JSON.stringify(analyses))
       localStorage.setItem('profitability-settings', JSON.stringify(settings))
       setStorageWarning('')
@@ -203,7 +206,7 @@ function App() {
       console.error('Could not save app data to localStorage.', error)
       setStorageWarning('Your browser could not save changes locally. Check available storage and browser privacy settings.')
     }
-  }, [profile, analyses, settings])
+  }, [profile, isLoggedOut, analyses, settings])
 
   useEffect(() => {
     try {
@@ -277,23 +280,21 @@ function App() {
 
   const logOut = async () => {
     setProfileMenuOpen(false)
-    if (!supabase) {
-      setToast({ text: 'Log out is unavailable because authentication is not configured.', error: true })
-      return
-    }
     try {
-      const { data, error: sessionError } = await supabase.auth.getSession()
-      if (sessionError) throw sessionError
-      if (!data.session) {
-        setToast({ text: 'There is no authenticated session to log out from. Your local profile was not changed.', error: true })
-        return
+      if (supabase) {
+        const { data, error: sessionError } = await supabase.auth.getSession()
+        if (sessionError) throw sessionError
+        if (data.session) {
+          const { error } = await supabase.auth.signOut()
+          if (error) throw error
+        }
       }
-      const { error } = await supabase.auth.signOut()
-      if (error) throw error
-      setProfile(null)
+
+      setIsLoggedOut(true)
       setGoogleIdentity(null)
       setPage('dashboard')
-      setToast({ text: 'You have been signed out.' })
+      setSelectedId(null)
+      setToast({ text: 'You are signed out. Your saved profile, analyses, and settings remain in this browser.' })
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : 'An unexpected error occurred.'
       setToast({ text: `Could not log out: ${message}`, error: true })
@@ -320,6 +321,7 @@ function App() {
   const clearAll = () => {
     if (!window.confirm('Clear all saved analyses, profile details, and settings from this browser? This cannot be undone.')) return
     setProfile(null)
+    setIsLoggedOut(false)
     setAnalyses([])
     setSettings({ darkMode: false })
     setSelectedId(null)
@@ -329,13 +331,19 @@ function App() {
 
   const currency = profile?.currency ?? 'USD'
 
-  if (!profile) {
+  if (!profile || isLoggedOut) {
     return (
       <>
-        <WelcomeScreen googleIdentity={googleIdentity} authError={authError} onCreate={(newProfile) => {
-          setProfile(newProfile)
-          setToast({ text: 'Your profile is ready. Start by creating your first analysis.' })
-        }} />
+        <WelcomeScreen googleIdentity={googleIdentity} authError={authError} savedProfile={profile}
+          onRestore={() => {
+            setIsLoggedOut(false)
+            setToast({ text: 'Your saved local profile has been restored.' })
+          }}
+          onCreate={(newProfile) => {
+            setProfile(newProfile)
+            setIsLoggedOut(false)
+            setToast({ text: 'Your profile is ready. Start by creating your first analysis.' })
+          }} />
         {toast && <div className="toast">{toast.text}</div>}
         {storageWarning && <div className="toast error">{storageWarning}</div>}
       </>
@@ -432,6 +440,10 @@ function App() {
           }} />}
           {page === 'settings' && <SettingsPage profile={profile} darkMode={settings.darkMode}
             onSave={(updated) => { setProfile(updated); setToast({ text: 'Profile and business details updated.' }) }}
+            onAvatarSave={(avatar) => {
+              setProfile((current) => current ? { ...current, avatar } : current)
+              setToast({ text: 'Profile photo saved.' })
+            }}
             onToggleTheme={() => setSettings((current) => ({ ...current, darkMode: !current.darkMode }))}
             onClear={clearAll} />}
         </div>
@@ -445,9 +457,11 @@ function pageTitle(page: Page) {
   return NAV_ITEMS.find((item) => item.id === page)?.label ?? 'Analysis results'
 }
 
-function WelcomeScreen({ googleIdentity, authError, onCreate }: {
+function WelcomeScreen({ googleIdentity, authError, savedProfile, onRestore, onCreate }: {
   googleIdentity: GoogleIdentity | null
   authError: string
+  savedProfile: Profile | null
+  onRestore: () => void
   onCreate: (profile: Profile) => void
 }) {
   const [error, setError] = useState('')
@@ -516,6 +530,11 @@ function WelcomeScreen({ googleIdentity, authError, onCreate }: {
           {error && <div className="alert" role="alert">{error}</div>}
           {authError && <div className="alert" role="alert">{authError}</div>}
           {googleIdentity && <p className="oauth-setup-message" role="status">Signed in with Google as {googleIdentity.email}. Complete your business details to create your local profile.</p>}
+          {savedProfile && !googleIdentity && <div className="saved-profile">
+            <p>Saved local profile: <strong>{savedProfile.fullName}</strong> ({savedProfile.email})</p>
+            <p>This profile is stored in this browser and is not a signed-in account.</p>
+            <button className="btn btn-primary" type="button" onClick={onRestore}>Continue with saved profile <ChevronRight /></button>
+          </div>}
           <form onSubmit={submit}>
             <div className="field-grid">
               <Field label="Full name" required><input autoComplete="name" value={values.fullName} onChange={(e) => update('fullName', e.target.value)} placeholder="e.g. Alex Morgan" /></Field>
@@ -839,13 +858,15 @@ function Reports({ analyses, currency }: { analyses: Analysis[]; currency: strin
   </>
 }
 
-function SettingsPage({ profile, darkMode, onSave, onToggleTheme, onClear }: {
-  profile: Profile; darkMode: boolean; onSave: (profile: Profile) => void; onToggleTheme: () => void; onClear: () => void
+function SettingsPage({ profile, darkMode, onSave, onAvatarSave, onToggleTheme, onClear }: {
+  profile: Profile; darkMode: boolean; onSave: (profile: Profile) => void; onAvatarSave: (avatar: string) => void
+  onToggleTheme: () => void; onClear: () => void
 }) {
   const [values, setValues] = useState(profile)
   const [error, setError] = useState('')
+  const [cropSource, setCropSource] = useState<string | null>(null)
+  const [cropZoom, setCropZoom] = useState(CIRCULAR_CROP_MIN_ZOOM)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  useEffect(() => setValues(profile), [profile])
   const set = (key: keyof Profile, value: string) => setValues((current) => ({ ...current, [key]: value }))
   const choosePicture = (file?: File) => {
     if (!file) return
@@ -853,14 +874,14 @@ function SettingsPage({ profile, darkMode, onSave, onToggleTheme, onClear }: {
       setError('Choose a JPG, PNG, or WebP image.')
       return
     }
-    if (file.size > 512 * 1024) {
-      setError('Choose an image smaller than 512 KB so it can be saved in this browser.')
+    if (file.size > 15 * 1024 * 1024) {
+      setError('Choose an image smaller than 15 MB.')
       return
     }
     const reader = new FileReader()
     reader.onload = () => {
       if (typeof reader.result === 'string') {
-        set('avatar', reader.result)
+        setCropSource(reader.result)
         setError('')
       } else {
         setError('The selected image could not be read. Please choose another file.')
@@ -921,7 +942,11 @@ function SettingsPage({ profile, darkMode, onSave, onToggleTheme, onClear }: {
             <strong>Profile picture</strong>
             <p>Upload a photo or choose an avatar style.</p>
             <div className="profile-picture-actions">
-              <button type="button" className="btn btn-outline" onClick={() => fileInputRef.current?.click()}><Upload />Upload photo</button>
+              <button type="button" className="btn btn-outline" onClick={() => fileInputRef.current?.click()}>
+                <Upload />{values.avatar?.startsWith('data:image/') ? 'Replace photo' : 'Upload photo'}
+              </button>
+              {values.avatar?.startsWith('data:image/') && <button type="button" className="btn btn-link"
+                onClick={() => { setCropSource(values.avatar ?? null); setCropZoom(CIRCULAR_CROP_MIN_ZOOM); setError('') }}>Edit photo</button>}
               <button type="button" className="btn btn-link" onClick={() => { set('avatar', ''); setError('') }}>Remove picture</button>
               <input ref={fileInputRef} className="visually-hidden" type="file" accept="image/jpeg,image/png,image/webp"
                 aria-label="Upload profile picture" onChange={(event) => {
@@ -938,9 +963,17 @@ function SettingsPage({ profile, darkMode, onSave, onToggleTheme, onClear }: {
                 </button>
               ))}
             </div>
-            <small>Images are stored in this browser only and are not synced to other devices. JPG, PNG, or WebP up to 512 KB.</small>
+            <small>Images are stored in this browser only and are not synced to other devices. JPG, PNG, or WebP up to 15 MB.</small>
           </div>
         </section>
+        {cropSource && <ProfilePhotoEditor key={cropSource} imageSrc={cropSource} initialZoom={cropZoom} error={error} onCancel={() => setCropSource(null)}
+          onReplace={() => fileInputRef.current?.click()} onError={setError} onSave={(avatar) => {
+            set('avatar', avatar)
+            setCropZoom(CIRCULAR_CROP_MIN_ZOOM)
+            onAvatarSave(avatar)
+            setCropSource(null)
+            setError('')
+          }} />}
         <h3 className="settings-section-label">Your details</h3>
         <div className="field-grid compact">
           <Field label="Full name" required><input value={values.fullName} onChange={(e) => set('fullName', e.target.value)} /></Field>
