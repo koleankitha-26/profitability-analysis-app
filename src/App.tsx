@@ -10,6 +10,14 @@ import {
 } from 'recharts'
 import type { User } from '@supabase/supabase-js'
 import { supabase, supabaseConfigMessage } from './lib/supabase'
+import {
+  ANALYSIS_COLUMNS, analysesForUser, analysisContentSignature, analysisFromSupabase, analysisSignature,
+  reconcileLocalAnalyses, saveAnalysisIdempotently,
+} from './lib/analyses'
+import {
+  clearAnalysisDraft, loadAnalysisDraft, saveAnalysisDraft,
+  type AnalysisDraft,
+} from './lib/analysisDraft'
 import { calculateProfitability, type Analysis, type AnalysisInput } from './utils/profitability'
 import BulkUpload from './components/BulkUpload'
 import ProfilePhotoEditor, { CIRCULAR_CROP_MIN_ZOOM } from './components/ProfilePhotoEditor'
@@ -30,17 +38,15 @@ type Profile = {
 
 type Settings = { darkMode: boolean }
 type GoogleIdentity = { fullName: string; email: string }
-type Page = 'dashboard' | 'new' | 'results' | 'history' | 'reports' | 'bulk' | 'settings'
-type FormValues = {
-  productName: string
-  quantity: string
-  sellingPrice: string
-  costPerUnit: string
-  customerName: string
-  additionalProductExpenses: string
-  additionalCustomerExpenses: string
-  sharedExpenses: string
+type SupabaseProfile = {
+  id: string
+  full_name: string | null
+  business_name: string | null
+  business_type: string | null
+  currency: string | null
 }
+type Page = 'dashboard' | 'new' | 'results' | 'history' | 'reports' | 'bulk' | 'settings'
+type FormValues = AnalysisDraft
 type FieldErrors = Partial<Record<keyof FormValues, string>>
 
 const NAV_ITEMS: { id: Page; label: string; icon: typeof Activity }[] = [
@@ -117,6 +123,15 @@ function initials(name: string) {
   return name.trim().split(/\s+/).slice(0, 2).map((part) => part[0]?.toUpperCase() ?? '').join('') || 'U'
 }
 
+function metadataFullName(user: User) {
+  const metadata = user.user_metadata
+  const givenAndFamilyName = [metadata.given_name, metadata.family_name]
+    .filter((value): value is string => typeof value === 'string' && Boolean(value.trim()))
+    .join(' ')
+  return [metadata.full_name, metadata.name, givenAndFamilyName]
+    .find((value) => typeof value === 'string' && value.trim())
+}
+
 function getGoogleIdentity(user: User): GoogleIdentity | null {
   const providers = [
     user.app_metadata.provider,
@@ -125,12 +140,71 @@ function getGoogleIdentity(user: User): GoogleIdentity | null {
   ]
   if (!providers.includes('google')) return null
 
-  const metadata = user.user_metadata
-  const fullName = [metadata.full_name, metadata.name].find((value) => typeof value === 'string' && value.trim())
+  const fullName = metadataFullName(user)
   return {
     fullName: typeof fullName === 'string' ? fullName.trim() : '',
     email: user.email ?? '',
   }
+}
+
+function profileFromRow(row: SupabaseProfile, user: User): Profile {
+  const metadataName = metadataFullName(user)
+  return {
+    fullName: row.full_name?.trim()
+      || (typeof metadataName === 'string' ? metadataName.trim() : '')
+      || user.email?.split('@')[0]
+      || '',
+    email: user.email ?? '',
+    businessName: row.business_name ?? '',
+    businessType: row.business_type ?? '',
+    currency: row.currency || 'USD',
+  }
+}
+
+async function getOrCreateSupabaseProfile(user: User): Promise<Profile> {
+  if (!supabase) throw new Error(supabaseConfigMessage)
+
+  const columns = 'id, full_name, business_name, business_type, currency'
+  const { data: existing, error: selectError } = await supabase
+    .from('profiles')
+    .select(columns)
+    .eq('id', user.id)
+    .maybeSingle()
+
+  if (selectError) throw new Error(`Could not load your profile from Supabase: ${selectError.message}`)
+  if (existing) return profileFromRow(existing, user)
+
+  const metadataName = metadataFullName(user)
+  const fullName = typeof metadataName === 'string'
+    ? metadataName.trim()
+    : user.email?.split('@')[0] ?? ''
+  const { data: created, error: insertError } = await supabase
+    .from('profiles')
+    .insert({
+      id: user.id,
+      full_name: fullName,
+      business_name: '',
+      business_type: '',
+      currency: 'USD',
+    })
+    .select(columns)
+    .single()
+
+  if (!insertError && created) return profileFromRow(created, user)
+
+  if (insertError?.code === '23505') {
+    const { data: racedProfile, error: racedSelectError } = await supabase
+      .from('profiles')
+      .select(columns)
+      .eq('id', user.id)
+      .maybeSingle()
+    if (!racedSelectError && racedProfile) return profileFromRow(racedProfile, user)
+    if (racedSelectError) {
+      throw new Error(`Could not load your profile after a concurrent sign-in: ${racedSelectError.message}`)
+    }
+  }
+
+  throw new Error(`Could not create your Supabase profile: ${insertError?.message ?? 'No profile row was returned.'}`)
 }
 
 function App() {
@@ -139,6 +213,15 @@ function App() {
   const [analyses, setAnalyses] = useState<Analysis[]>(() => loadStored('profitability-analyses', []))
   const [settings, setSettings] = useState<Settings>(() => loadStored('profitability-settings', { darkMode: false }))
   const [googleIdentity, setGoogleIdentity] = useState<GoogleIdentity | null>(null)
+  const [authUser, setAuthUser] = useState<User | null>(null)
+  const [authResolved, setAuthResolved] = useState(!supabase)
+  const [profileLoading, setProfileLoading] = useState(Boolean(supabase))
+  const [profileLoadAttempt, setProfileLoadAttempt] = useState(0)
+  const [analysisLoading, setAnalysisLoading] = useState(Boolean(supabase))
+  const [retryingAnalyses, setRetryingAnalyses] = useState(false)
+  const [analysisLoadError, setAnalysisLoadError] = useState('')
+  const [remoteAnalysisSignatures, setRemoteAnalysisSignatures] = useState<Set<string>>(() => new Set())
+  const [browserOnlyAnalysisIds, setBrowserOnlyAnalysisIds] = useState<Set<string>>(() => new Set())
   const [authError, setAuthError] = useState('')
   const [page, setPage] = useState<Page>('dashboard')
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -148,9 +231,14 @@ function App() {
   const [profileMenuOpen, setProfileMenuOpen] = useState(false)
   const [toast, setToast] = useState<{ text: string; error?: boolean } | null>(null)
   const [storageWarning, setStorageWarning] = useState('')
+  const authUserId = authUser?.id
   const profileMenuRef = useRef<HTMLDivElement>(null)
   const resizingSidebarRef = useRef(false)
-  const selectedAnalysis = analyses.find((item) => item.id === selectedId) ?? null
+  const hiddenLocalAnalysesRef = useRef<Analysis[]>([])
+  const visibleAnalyses = authUserId
+    ? analysesForUser(analyses, authUserId)
+    : analyses
+  const selectedAnalysis = visibleAnalyses.find((item) => item.id === selectedId) ?? null
 
   useEffect(() => {
     if (!supabase) return
@@ -167,11 +255,17 @@ function App() {
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       if (!active) return
       if (session?.user) {
-        const identity = getGoogleIdentity(session.user)
-        setGoogleIdentity(identity)
-        if (identity) setAuthError('')
+        setAuthUser(session.user)
+        setGoogleIdentity(getGoogleIdentity(session.user))
+        setProfileLoading(true)
+        setAuthResolved(true)
+        setAuthError('')
       } else {
+        setAuthUser(null)
         setGoogleIdentity(null)
+        setProfileLoading(false)
+        setAnalysisLoading(false)
+        setAuthResolved(true)
       }
     })
 
@@ -179,13 +273,23 @@ function App() {
       if (!active) return
       if (error) {
         setAuthError(`Could not check your Supabase session: ${error.message}`)
+        setAnalysisLoading(false)
       } else if (data.session?.user) {
+        setAuthUser(data.session.user)
         setGoogleIdentity(getGoogleIdentity(data.session.user))
+        setProfileLoading(true)
+      } else {
+        setProfileLoading(false)
+        setAnalysisLoading(false)
       }
+      setAuthResolved(true)
     }).catch((error: unknown) => {
       if (!active) return
       const message = error instanceof Error ? error.message : 'An unexpected error occurred.'
       setAuthError(`Could not check your Supabase session: ${message}`)
+      setProfileLoading(false)
+      setAnalysisLoading(false)
+      setAuthResolved(true)
     })
 
     return () => {
@@ -195,18 +299,134 @@ function App() {
   }, [])
 
   useEffect(() => {
+    if (!supabase || !authUser) return
+
+    let active = true
+    void getOrCreateSupabaseProfile(authUser).then((loadedProfile) => {
+      if (!active) return
+      setProfile(loadedProfile)
+      setIsLoggedOut(false)
+      setAuthError('')
+    }).catch((error: unknown) => {
+      if (!active) return
+      const message = error instanceof Error ? error.message : 'An unexpected error occurred.'
+      setProfile(null)
+      setAuthError(message)
+    }).finally(() => {
+      if (active) setProfileLoading(false)
+    })
+
+    return () => {
+      active = false
+    }
+  }, [authUser, profileLoadAttempt])
+
+  useEffect(() => {
+    if (!supabase || !authUserId) {
+      setRemoteAnalysisSignatures(new Set())
+      setAnalysisLoadError('')
+      setAnalysisLoading(false)
+      if (!authUserId) {
+        hiddenLocalAnalysesRef.current = []
+        const localAnalyses = loadStored<Analysis[]>('profitability-analyses', [])
+        setAnalyses(localAnalyses)
+        setBrowserOnlyAnalysisIds(new Set(
+          localAnalyses.filter((analysis) => analysis.syncStatus !== 'synced').map((analysis) => analysis.id),
+        ))
+      }
+      return
+    }
+
+    let active = true
+    setAnalysisLoading(true)
+    setAnalysisLoadError('')
+
+    void (async () => {
+      try {
+        const remoteRows = []
+        const pageSize = 1000
+        for (let offset = 0; ; offset += pageSize) {
+          const { data, error } = await supabase
+            .from('analyses')
+            .select(ANALYSIS_COLUMNS)
+            .eq('user_id', authUserId)
+            .order('created_at', { ascending: false })
+            .range(offset, offset + pageSize - 1)
+
+          if (!active) return
+          if (error) throw new Error(error.message)
+          if ((data ?? []).some((row) => row.user_id !== authUserId)) {
+            throw new Error('Supabase returned an analysis row that does not belong to the signed-in user.')
+          }
+          remoteRows.push(...(data ?? []))
+          if (!data || data.length < pageSize) break
+        }
+
+        const remoteAnalyses = remoteRows.map((row) => analysisFromSupabase(row))
+        const remoteSignatures = new Set(remoteAnalyses.map(analysisSignature))
+        const localAnalyses = loadStored<Analysis[]>('profitability-analyses', [])
+        const ownedLocal = localAnalyses.filter((analysis) => analysis.syncUserId === authUserId)
+        const unassignedLocal = localAnalyses.filter((analysis) => !analysis.syncUserId)
+        const browserOnlyAnalyses = reconcileLocalAnalyses(ownedLocal, remoteAnalyses)
+        const unassignedPending = reconcileLocalAnalyses(unassignedLocal, remoteAnalyses)
+        const visibleIds = new Set([
+          ...remoteAnalyses.map((analysis) => analysis.id),
+          ...browserOnlyAnalyses.map((analysis) => analysis.id),
+        ])
+        hiddenLocalAnalysesRef.current = localAnalyses.filter((analysis) => !visibleIds.has(analysis.id))
+
+        setRemoteAnalysisSignatures(remoteSignatures)
+        setBrowserOnlyAnalysisIds(new Set([
+          ...browserOnlyAnalyses,
+          ...unassignedPending,
+        ].map((analysis) => analysis.id)))
+        setAnalyses([...remoteAnalyses, ...browserOnlyAnalyses].sort(
+          (first, second) => Date.parse(second.createdAt) - Date.parse(first.createdAt),
+        ))
+      } catch (error: unknown) {
+        if (!active) return
+        const message = error instanceof Error ? error.message : 'An unexpected database error occurred.'
+        setAnalysisLoadError(`Could not load analysis history from Supabase: ${message}`)
+        const localAnalyses = loadStored<Analysis[]>('profitability-analyses', [])
+        const visibleLocal = localAnalyses.filter(
+          (analysis) => !analysis.syncUserId || analysis.syncUserId === authUserId,
+        )
+        hiddenLocalAnalysesRef.current = localAnalyses.filter(
+          (analysis) => analysis.syncUserId && analysis.syncUserId !== authUserId,
+        )
+        setAnalyses(visibleLocal)
+        setBrowserOnlyAnalysisIds(new Set(
+          visibleLocal.filter((analysis) => analysis.syncStatus !== 'synced').map((analysis) => analysis.id),
+        ))
+      } finally {
+        if (active) setAnalysisLoading(false)
+      }
+    })()
+
+    return () => {
+      active = false
+    }
+  }, [authUserId])
+
+  useEffect(() => {
     try {
-      if (profile) localStorage.setItem('profitability-profile', JSON.stringify(profile))
-      else if (!isLoggedOut) localStorage.removeItem('profitability-profile')
+      if (!authUser) {
+        if (profile) localStorage.setItem('profitability-profile', JSON.stringify(profile))
+        else if (!isLoggedOut) localStorage.removeItem('profitability-profile')
+      }
       localStorage.setItem('profitability-logged-out', JSON.stringify(isLoggedOut))
-      localStorage.setItem('profitability-analyses', JSON.stringify(analyses))
+      const storedById = new Map(
+        hiddenLocalAnalysesRef.current.map((analysis) => [analysis.id, analysis]),
+      )
+      analyses.forEach((analysis) => storedById.set(analysis.id, analysis))
+      localStorage.setItem('profitability-analyses', JSON.stringify([...storedById.values()]))
       localStorage.setItem('profitability-settings', JSON.stringify(settings))
       setStorageWarning('')
     } catch (error) {
       console.error('Could not save app data to localStorage.', error)
       setStorageWarning('Your browser could not save changes locally. Check available storage and browser privacy settings.')
     }
-  }, [profile, isLoggedOut, analyses, settings])
+  }, [profile, isLoggedOut, analyses, settings, authUser])
 
   useEffect(() => {
     try {
@@ -301,35 +521,305 @@ function App() {
     }
   }
 
+  const saveProfile = async (updated: Profile) => {
+    if (authUser && supabase) {
+      const { data, error } = await supabase
+        .from('profiles')
+        .update({
+          full_name: updated.fullName.trim(),
+          business_name: updated.businessName.trim(),
+          business_type: updated.businessType,
+          currency: updated.currency,
+        })
+        .eq('id', authUser.id)
+        .select('id, full_name, business_name, business_type, currency')
+        .single()
+
+      if (error) throw new Error(`Could not save your profile to Supabase: ${error.message}`)
+      if (!data) throw new Error('Could not save your profile to Supabase: no profile row was returned.')
+
+      setProfile({
+        ...updated,
+        ...profileFromRow(data, authUser),
+        jobTitle: updated.jobTitle,
+        phoneNumber: updated.phoneNumber,
+        businessWebsite: updated.businessWebsite,
+        businessLocation: updated.businessLocation,
+        businessDescription: updated.businessDescription,
+        avatar: updated.avatar,
+      })
+    } else {
+      setProfile(updated)
+    }
+    setToast({ text: 'Profile and business details updated.' })
+  }
+
   const openAnalysis = (analysis: Analysis) => {
     setSelectedId(analysis.id)
     goTo('results')
   }
 
-  const deleteAnalysis = (id: string) => {
+  const deleteAnalysis = async (id: string) => {
     const target = analyses.find((item) => item.id === id)
     if (!target) return
-    if (!window.confirm(`Delete the analysis for "${target.productName}"? This cannot be undone.`)) return
+    const signature = analysisSignature(target)
+    const isRemoteAnalysis = !browserOnlyAnalysisIds.has(target.id) && remoteAnalysisSignatures.has(signature)
+    const confirmationMessage = isRemoteAnalysis
+      ? `Delete the analysis for "${target.productName}" from your Supabase account? This cannot be undone.`
+      : `Remove the browser-only analysis for "${target.productName}"? It has not been saved to Supabase.`
+    if (!window.confirm(confirmationMessage)) return
+
+    if (isRemoteAnalysis && authUser && supabase) {
+      try {
+        const { data, error } = await supabase
+          .from('analyses')
+          .delete()
+          .eq('id', target.id)
+          .eq('user_id', authUser.id)
+          .select('id')
+          .maybeSingle()
+
+        if (error) {
+          setToast({ text: `Could not delete this analysis from Supabase: ${error.message}`, error: true })
+          return
+        }
+        if (!data) {
+          setToast({ text: 'Supabase did not confirm deleting this analysis. It remains in your history.', error: true })
+          return
+        }
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : 'An unexpected database error occurred.'
+        setToast({ text: `Could not delete this analysis from Supabase: ${message}`, error: true })
+        return
+      }
+    }
+
     setAnalyses((current) => current.filter((item) => item.id !== id))
+    setBrowserOnlyAnalysisIds((current) => {
+      if (!current.has(id)) return current
+      const next = new Set(current)
+      next.delete(id)
+      return next
+    })
+    if (isRemoteAnalysis) {
+      setRemoteAnalysisSignatures((current) => {
+        const stillPresent = analyses.some((item) => item.id !== id && analysisSignature(item) === signature)
+        if (stillPresent) return current
+        const next = new Set(current)
+        next.delete(signature)
+        return next
+      })
+    }
     if (selectedId === id) {
       setSelectedId(null)
       goTo('history')
     }
-    setToast({ text: 'Analysis deleted.' })
+    setToast({ text: isRemoteAnalysis ? 'Analysis deleted from Supabase.' : 'Browser-only analysis removed.' })
+  }
+
+  const retryPendingAnalyses = async () => {
+    if (!supabase || !authUser) {
+      setToast({ text: 'Sign in before retrying browser-only analyses.', error: true })
+      return
+    }
+
+    const pendingById = new Map<string, Analysis>()
+    for (const analysis of [
+      ...loadStored<Analysis[]>('profitability-analyses', []),
+      ...hiddenLocalAnalysesRef.current,
+      ...analyses,
+    ]) {
+      if (browserOnlyAnalysisIds.has(analysis.id)) pendingById.set(analysis.id, analysis)
+    }
+    const pending = [...pendingById.values()]
+    if (!pending.length) return
+
+    const legacyCount = pending.filter((analysis) => !analysis.syncUserId).length
+    const unassignedPending = pending.filter((analysis) => !analysis.syncUserId)
+    const message = legacyCount
+      ? `${pending.length - legacyCount} record(s) are associated with this account. ${legacyCount} legacy record(s) have no saved owner and will be checked against Supabase, but will not be uploaded without your confirmation.`
+      : `Retry saving ${pending.length} browser-only analysis record(s) associated with this account?`
+    if (!window.confirm(message)) return
+
+    setRetryingAnalyses(true)
+    try {
+      const { data: { user }, error: userError } = await supabase.auth.getUser()
+      if (userError) throw new Error(`Could not verify the current Supabase user: ${userError.message}`)
+      if (!user || user.id !== authUser.id) {
+        throw new Error('The current Supabase session does not match the displayed account. Sign in again before retrying.')
+      }
+
+      const remoteRows: Array<{
+        id: string
+        user_id: string
+        product_name: string
+        customer_name: string | null
+        quantity_sold: number
+        selling_price: number
+        cost_per_unit: number
+        additional_product_expenses: number
+        additional_customer_expenses: number
+        allocated_shared_expenses: number
+        created_at: string
+      }> = []
+      const pageSize = 1000
+      for (let offset = 0; ; offset += pageSize) {
+        const { data, error } = await supabase
+          .from('analyses')
+          .select(ANALYSIS_COLUMNS)
+          .eq('user_id', user.id)
+          .order('created_at', { ascending: false })
+          .range(offset, offset + pageSize - 1)
+        if (error) throw new Error(`Could not check existing analyses before retrying: ${error.message}`)
+        remoteRows.push(...(data ?? []))
+        if (!data || data.length < pageSize) break
+      }
+      const remoteAnalyses = remoteRows.map((row) => analysisFromSupabase(row))
+      const confirmed = new Map<string, Analysis>()
+      const failures: string[] = []
+
+      for (const localRecord of pending) {
+        if (localRecord.syncUserId && localRecord.syncUserId !== user.id) {
+          failures.push(`${localRecord.productName}: saved for a different account`)
+          continue
+        }
+
+        const existingById = remoteAnalyses.find((record) => record.id === localRecord.id)
+        if (existingById) {
+          if (analysisContentSignature(existingById) !== analysisContentSignature(localRecord)) {
+            failures.push(`${localRecord.productName}: this ID already exists with different data`)
+            continue
+          }
+          confirmed.set(localRecord.id, existingById)
+          continue
+        }
+
+        const equivalentRemote = remoteAnalyses.filter((record) =>
+          analysisContentSignature(record) === analysisContentSignature(localRecord))
+        if (equivalentRemote.length) {
+          failures.push(`${localRecord.productName}: matching data already exists under another ID; not uploaded to avoid a duplicate`)
+          continue
+        }
+
+        if (!localRecord.syncUserId && !window.confirm(
+          `The legacy browser-only analysis "${localRecord.productName}" was not found in your Supabase account. Confirm that it belongs to this account and save it now?`,
+        )) {
+          failures.push(`${localRecord.productName}: not uploaded because ownership was not confirmed`)
+          continue
+        }
+
+        try {
+          const { data: { user: currentUser }, error: currentUserError } = await supabase.auth.getUser()
+          if (currentUserError) throw new Error(`Could not recheck the session: ${currentUserError.message}`)
+          if (!currentUser || currentUser.id !== user.id) {
+            throw new Error('The signed-in account changed during recovery.')
+          }
+          const savedRow = await saveAnalysisIdempotently(
+            supabase,
+            localRecord,
+            user.id,
+            localRecord.id,
+            localRecord.createdAt,
+          )
+          confirmed.set(localRecord.id, analysisFromSupabase(savedRow))
+        } catch (error: unknown) {
+          failures.push(`${localRecord.productName}: ${error instanceof Error ? error.message : 'save was not confirmed'}`)
+        }
+      }
+
+      const claimedRecords = unassignedPending.filter((analysis) => confirmed.has(analysis.id))
+      claimedRecords.forEach((analysis) => { analysis.syncUserId = user.id })
+      if (claimedRecords.length) {
+        const claimedIds = new Set(claimedRecords.map((analysis) => analysis.id))
+        hiddenLocalAnalysesRef.current = hiddenLocalAnalysesRef.current.filter(
+          (analysis) => !claimedIds.has(analysis.id),
+        )
+        setAnalyses((current) => {
+          const ids = new Set(current.map((analysis) => analysis.id))
+          return [...current, ...claimedRecords.filter((analysis) => !ids.has(analysis.id))]
+        })
+        try {
+          const localRecords = loadStored<Analysis[]>('profitability-analyses', [])
+          localStorage.setItem('profitability-analyses', JSON.stringify(
+            localRecords.map((analysis) => claimedIds.has(analysis.id)
+              ? { ...analysis, syncUserId: user.id }
+              : analysis),
+          ))
+        } catch (error) {
+          console.error('Could not persist the claimed analysis ownership.', error)
+          setStorageWarning('These browser-only records are assigned to this account for this session, but their ownership could not be saved locally.')
+        }
+      }
+
+      if (confirmed.size) {
+        const synced = [...confirmed.values()]
+        setAnalyses((current) => {
+          const syncedById = new Map(synced.map((analysis) => [analysis.id, analysis]))
+          return current.map((analysis) => syncedById.get(analysis.id) ?? analysis)
+        })
+        setBrowserOnlyAnalysisIds((current) => {
+          const next = new Set(current)
+          confirmed.forEach((_, id) => next.delete(id))
+          return next
+        })
+        setRemoteAnalysisSignatures((current) => {
+          const next = new Set(current)
+          synced.forEach((analysis) => next.add(analysisSignature(analysis)))
+          return next
+        })
+      }
+      setToast(failures.length
+        ? { text: `${confirmed.size} record(s) confirmed in Supabase. ${failures.length} remain browser-only: ${failures.join('; ')}`, error: true }
+        : { text: `${confirmed.size} pending record(s) confirmed in Supabase.` })
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'An unexpected recovery error occurred.'
+      setToast({ text: `Pending analyses were preserved; recovery failed: ${message}`, error: true })
+    } finally {
+      setRetryingAnalyses(false)
+    }
   }
 
   const clearAll = () => {
-    if (!window.confirm('Clear all saved analyses, profile details, and settings from this browser? This cannot be undone.')) return
-    setProfile(null)
+    const message = authUser
+      ? 'Clear browser-only analyses and local settings? Supabase analyses and your profile will not be deleted.'
+      : 'Clear all saved analyses, profile details, and settings from this browser? This action cannot be undone.'
+    if (!window.confirm(message)) return
+    if (!authUser) setProfile(null)
     setIsLoggedOut(false)
-    setAnalyses([])
+    setAnalyses((current) => authUser
+      ? current.filter((item) => remoteAnalysisSignatures.has(analysisSignature(item)))
+      : [])
+    if (authUser) setBrowserOnlyAnalysisIds(new Set())
     setSettings({ darkMode: false })
     setSelectedId(null)
     setPage('dashboard')
-    setToast({ text: 'All locally saved data has been cleared.' })
+    setToast({ text: authUser
+      ? 'Browser-only analyses and local settings have been cleared. Your Supabase analyses and profile are unchanged.'
+      : 'All locally saved data has been cleared.' })
   }
 
   const currency = profile?.currency ?? 'USD'
+  if (!authResolved || (authUser && (profileLoading || analysisLoading))) {
+    return <div className="welcome-screen"><div className="welcome-card"><section className="welcome-main">
+      <h2>Loading your profile</h2><p role="status">Checking your Supabase session and profile…</p>
+    </section></div></div>
+  }
+
+  if (authUser && !profile) {
+    return <div className="welcome-screen"><div className="welcome-card"><section className="welcome-main">
+      <h2>Could not load your Supabase profile</h2>
+      <p className="alert" role="alert">{authError || 'Your profile could not be loaded or created.'}</p>
+      <p>Check that your profiles table allows this signed-in user to select, insert, and update only their own row, then retry.</p>
+      <div className="form-actions">
+        <button className="btn btn-primary" onClick={() => {
+          setAuthError('')
+          setProfileLoading(true)
+          setProfileLoadAttempt((attempt) => attempt + 1)
+        }}>Retry</button>
+        <button className="btn btn-outline" onClick={() => void logOut()}>Sign out</button>
+      </div>
+    </section></div></div>
+  }
 
   if (!profile || isLoggedOut) {
     return (
@@ -419,27 +909,149 @@ function App() {
         </header>
         <div className="page-content">
           {storageWarning && <div className="alert" role="alert">{storageWarning}</div>}
-          {page === 'dashboard' && <Dashboard analyses={analyses} currency={currency} onNew={() => goTo('new')} onView={openAnalysis} />}
-          {page === 'new' && <NewAnalysis currency={currency} onCancel={() => goTo('dashboard')} onSave={(input) => {
+          {analysisLoadError && <div className="alert" role="alert">{analysisLoadError} Browser-only records remain available in this browser.</div>}
+          {!analysisLoading && browserOnlyAnalysisIds.size > 0 &&
+            <div className="alert" role="status">
+              {browserOnlyAnalysisIds.size} local analysis record(s) are not yet confirmed in Supabase.
+              {authUser
+                ? <> They are being preserved in this browser. <button className="btn-link" onClick={() => void retryPendingAnalyses()} disabled={retryingAnalyses}>
+                    {retryingAnalyses ? 'Checking and retrying…' : 'Review and retry'}
+                  </button></>
+                : ' They remain in this browser; sign in to verify or recover them.'}
+            </div>}
+          {page === 'dashboard' && <Dashboard analyses={visibleAnalyses} currency={currency} localOnlyIds={browserOnlyAnalysisIds} onNew={() => goTo('new')} onView={openAnalysis} />}
+          {page === 'new' && <NewAnalysis currency={currency} onCancel={() => goTo('dashboard')} onSave={async (input) => {
             const calculated = calculateProfitability(input)
-            const record: Analysis = { ...input, ...calculated, id: crypto.randomUUID(), createdAt: new Date().toISOString() }
-            setAnalyses((current) => [record, ...current])
-            setSelectedId(record.id)
-            setPage('results')
-            setToast({ text: 'Analysis calculated and saved to your history.' })
+            const createdAt = new Date().toISOString()
+            let record: Analysis = {
+              ...input,
+              ...calculated,
+              id: crypto.randomUUID(),
+              createdAt,
+              syncStatus: 'pending',
+              ...(authUserId ? { syncUserId: authUserId } : {}),
+            }
+            setAnalyses((current) => current.some((item) => item.id === record.id) ? current : [record, ...current])
+            setBrowserOnlyAnalysisIds((current) => new Set(current).add(record.id))
+            let savedLocally = false
+            try {
+              const stored = loadStored<Analysis[]>('profitability-analyses', analyses)
+              if (!stored.some((item) => item.id === record.id)) {
+                localStorage.setItem('profitability-analyses', JSON.stringify([record, ...stored]))
+              }
+              savedLocally = true
+            } catch (error) {
+              console.error('Could not preserve the pending analysis in localStorage.', error)
+              setStorageWarning('This analysis could not be safely stored in this browser. Keep this page open and retry; do not close it until it is saved.')
+            }
+            if (supabase) {
+              const { data: { session }, error: sessionError } = await supabase.auth.getSession()
+              if (sessionError) {
+                setToast({ text: `Analysis is preserved in this browser but was not confirmed in Supabase: ${sessionError.message}`, error: true })
+                return false
+              }
+
+              let databaseUser: User | null = null
+              if (session) {
+                const { data: { user }, error: userError } = await supabase.auth.getUser()
+                if (userError) {
+                  setToast({ text: `Analysis is preserved in this browser but the Supabase user could not be verified: ${userError.message}`, error: true })
+                  return false
+                }
+                if (!user || user.id !== session.user.id) {
+                  setToast({ text: 'Analysis is preserved in this browser but the Supabase user could not be verified. Please sign in again and retry.', error: true })
+                  return false
+                }
+                databaseUser = user
+              } else if (authUser) {
+                setToast({ text: 'Your session has expired. The analysis is preserved in this browser; sign in again and use Review and retry.', error: true })
+                return false
+              }
+
+              if (databaseUser) {
+                record.syncUserId = databaseUser.id
+                try {
+                  const stored = loadStored<Analysis[]>('profitability-analyses', analyses)
+                  localStorage.setItem('profitability-analyses', JSON.stringify(
+                    stored.map((item) => item.id === record.id ? record : item),
+                  ))
+                } catch (error) {
+                  console.error('Could not persist the pending analysis owner.', error)
+                  setStorageWarning('The pending analysis is still in memory, but its account ownership could not be saved locally.')
+                }
+                try {
+                  const savedRow = await saveAnalysisIdempotently(
+                    supabase,
+                    input,
+                    databaseUser.id,
+                    record.id,
+                    record.createdAt,
+                  )
+                  record = analysisFromSupabase(savedRow)
+                  setAnalyses((current) => current.map((item) => item.id === record.id ? record : item))
+                  setBrowserOnlyAnalysisIds((current) => {
+                    const next = new Set(current)
+                    next.delete(record.id)
+                    return next
+                  })
+                  setRemoteAnalysisSignatures((current) => new Set(current).add(analysisSignature(record)))
+                  setToast({ text: 'Analysis confirmed in your Supabase account.' })
+                  if (!clearAnalysisDraft(sessionStorage)) {
+                    setToast({ text: 'Analysis was saved, but the form draft could not be cleared from this tab.', error: true })
+                  }
+                  setSelectedId(record.id)
+                  setPage('results')
+                  return true
+                } catch (error: unknown) {
+                  const message = error instanceof Error ? error.message : 'An unexpected database error occurred.'
+                  setToast({ text: `Analysis is preserved in this browser but was not confirmed in Supabase: ${message} Use Review and retry after checking your connection.`, error: true })
+                  return false
+                }
+              } else {
+                setToast({ text: 'Analysis saved in this browser only; sign in and use Review and retry to save it to Supabase.', error: true })
+                if (savedLocally) {
+                  if (!clearAnalysisDraft(sessionStorage)) {
+                    setToast({ text: 'Analysis was saved in this browser, but the form draft could not be cleared from this tab.', error: true })
+                  }
+                  setSelectedId(record.id)
+                  setPage('results')
+                }
+                return savedLocally
+              }
+            } else {
+              setToast({ text: 'Analysis is browser-only because Supabase is not configured. It remains pending for recovery after sign-in.', error: true })
+              if (savedLocally) {
+                if (!clearAnalysisDraft(sessionStorage)) {
+                  setToast({ text: 'Analysis was saved in this browser, but the form draft could not be cleared from this tab.', error: true })
+                }
+                setSelectedId(record.id)
+                setPage('results')
+              }
+              return savedLocally
+            }
           }} />}
           {page === 'results' && selectedAnalysis && <Results analysis={selectedAnalysis} currency={currency} onHistory={() => goTo('history')} onNew={() => goTo('new')} />}
           {page === 'results' && !selectedAnalysis && <MissingResult onHistory={() => goTo('history')} />}
-          {page === 'history' && <History analyses={analyses} currency={currency} onView={openAnalysis} onDelete={deleteAnalysis} onNew={() => goTo('new')} />}
-          {page === 'reports' && <Reports analyses={analyses} currency={currency} />}
+          {page === 'history' && <History analyses={visibleAnalyses} currency={currency} localOnlyIds={browserOnlyAnalysisIds} onView={openAnalysis} onDelete={deleteAnalysis} onNew={() => goTo('new')} />}
+          {page === 'reports' && <Reports analyses={visibleAnalyses} currency={currency} />}
           {page === 'bulk' && <BulkUpload currency={currency} onImported={(records) => {
+            setRemoteAnalysisSignatures((current) => {
+              const next = new Set(current)
+              records.forEach((record) => next.add(analysisSignature(record)))
+              return next
+            })
+            setBrowserOnlyAnalysisIds((current) => {
+              if (!current.size) return current
+              const importedIds = new Set(records.map((record) => record.id))
+              return new Set([...current].filter((id) => !importedIds.has(id)))
+            })
             setAnalyses((current) => {
               const currentIds = new Set(current.map((record) => record.id))
               return [...records.filter((record) => !currentIds.has(record.id)), ...current]
             })
           }} />}
-          {page === 'settings' && <SettingsPage profile={profile} darkMode={settings.darkMode}
-            onSave={(updated) => { setProfile(updated); setToast({ text: 'Profile and business details updated.' }) }}
+          {page === 'settings' && <SettingsPage profile={profile} darkMode={settings.darkMode} emailReadOnly={Boolean(authUser)}
+            onSave={saveProfile}
             onAvatarSave={(avatar) => {
               setProfile((current) => current ? { ...current, avatar } : current)
               setToast({ text: 'Profile photo saved.' })
@@ -579,8 +1191,9 @@ function MetricCard({ label, value, foot, icon: Icon, mood }: { label: string; v
   </div>
 }
 
-function Dashboard({ analyses, currency, onNew, onView }: {
-  analyses: Analysis[]; currency: string; onNew: () => void; onView: (analysis: Analysis) => void
+function Dashboard({ analyses, currency, localOnlyIds, onNew, onView }: {
+  analyses: Analysis[]; currency: string; localOnlyIds: ReadonlySet<string>
+  onNew: () => void; onView: (analysis: Analysis) => void
 }) {
   const totals = totalsFor(analyses)
   const averageMargin = totals.revenue === 0 ? null : (totals.profit / totals.revenue) * 100
@@ -607,7 +1220,7 @@ function Dashboard({ analyses, currency, onNew, onView }: {
     <div className="card section-card">
       <div className="section-header"><div><h2 className="card-title">Recent analyses</h2><p className="card-subtitle">Your latest saved profitability calculations</p></div><button className="btn-link" onClick={() => onNew()}>+ New analysis</button></div>
       {analyses.length === 0 ? <div className="table-empty"><Package /><strong>Your dashboard is ready when you are</strong><p>Create your first analysis to see revenue, costs, and trends here.</p><button className="btn btn-primary" onClick={onNew}><Plus />Create first analysis</button></div> :
-        <AnalysisTable analyses={analyses.slice(0, 5)} currency={currency} onView={onView} />}
+        <AnalysisTable analyses={analyses.slice(0, 5)} currency={currency} localOnlyIds={localOnlyIds} onView={onView} />}
     </div>
   </>
 }
@@ -656,13 +1269,14 @@ function totalsFor(analyses: Analysis[]) {
   }), { revenue: 0, cost: 0, profit: 0 })
 }
 
-function AnalysisTable({ analyses, currency, onView, onDelete }: {
+function AnalysisTable({ analyses, currency, localOnlyIds, onView, onDelete }: {
   analyses: Analysis[]; currency: string; onView: (analysis: Analysis) => void; onDelete?: (id: string) => void
+  localOnlyIds?: ReadonlySet<string>
 }) {
   return <div className="table-scroll"><table>
     <thead><tr><th>Date</th><th>Product</th><th>Customer</th><th>Revenue</th><th>Total cost</th><th>Profit / loss</th><th>Margin</th><th>Status</th><th /></tr></thead>
     <tbody>{analyses.map((item) => <tr key={item.id}>
-      <td>{shortDate(item.createdAt)}</td><td><strong>{item.productName}</strong></td><td>{item.customerName || '—'}</td>
+      <td>{shortDate(item.createdAt)}</td><td><strong>{item.productName}</strong>{localOnlyIds?.has(item.id) && <small className="analysis-local-only">Browser only</small>}</td><td>{item.customerName || '—'}</td>
       <td>{money(item.revenue, currency)}</td><td>{money(item.totalCost, currency)}</td>
       <td className={item.profit >= 0 ? 'profit-text' : 'loss-text'}>{money(item.profit, currency)}</td>
       <td>{item.margin === null ? 'N/A' : `${item.margin.toFixed(1)}%`}</td>
@@ -673,38 +1287,104 @@ function AnalysisTable({ analyses, currency, onView, onDelete }: {
 }
 
 function NewAnalysis({ currency, onSave, onCancel }: {
-  currency: string; onSave: (input: AnalysisInput) => void; onCancel: () => void
+  currency: string; onSave: (input: AnalysisInput) => Promise<boolean>; onCancel: () => void
 }) {
-  const [values, setValues] = useState<FormValues>(EMPTY_FORM)
+  const [values, setValues] = useState<FormValues>(() => {
+    try {
+      return loadAnalysisDraft(sessionStorage) ?? EMPTY_FORM
+    } catch (error) {
+      console.error('Could not restore the analysis draft.', error)
+      return EMPTY_FORM
+    }
+  })
   const [errors, setErrors] = useState<FieldErrors>({})
   const [formError, setFormError] = useState('')
-  const set = (key: keyof FormValues, value: string) => setValues((current) => ({ ...current, [key]: value }))
+  const [saving, setSaving] = useState(false)
+  const set = (key: keyof FormValues, value: string) => {
+    const next = { ...values, [key]: value }
+    setValues(next)
+    try {
+      saveAnalysisDraft(sessionStorage, next)
+      setFormError('')
+    } catch (error) {
+      console.error('Could not save the analysis draft.', error)
+      setFormError('Your changes could not be saved for later in this tab. Keep this page open until they are saved.')
+    }
+  }
   const validate = () => {
     const next: FieldErrors = {}
     if (!values.productName.trim()) next.productName = 'Enter a product or service name.'
-    if (!values.quantity || !Number.isFinite(Number(values.quantity)) || Number(values.quantity) <= 0) next.quantity = 'Quantity must be greater than zero.'
+    if (!values.quantity || !Number.isFinite(Number(values.quantity)) || Number(values.quantity) <= 0) next.quantity = 'Quantity must be a positive finite value within the safe calculation range.'
     for (const key of ['sellingPrice', 'costPerUnit', 'additionalProductExpenses', 'additionalCustomerExpenses', 'sharedExpenses'] as const) {
       const raw = values[key]
       if (raw.trim() === '' || !Number.isFinite(Number(raw)) || Number(raw) < 0) next[key] = 'Enter a valid amount of zero or more.'
     }
+    if (!Object.keys(next).length) {
+      try {
+        calculateProfitability({
+          productName: values.productName.trim(),
+          customerName: values.customerName.trim(),
+          quantity: Number(values.quantity),
+          sellingPrice: Number(values.sellingPrice),
+          costPerUnit: Number(values.costPerUnit),
+          additionalProductExpenses: Number(values.additionalProductExpenses),
+          additionalCustomerExpenses: Number(values.additionalCustomerExpenses),
+          sharedExpenses: Number(values.sharedExpenses),
+        })
+      } catch (error: unknown) {
+        next.quantity = error instanceof Error ? error.message : 'These values cannot be calculated safely.'
+      }
+    }
     setErrors(next)
     return Object.keys(next).length === 0
   }
-  const submit = (event: FormEvent) => {
+  const submit = async (event: FormEvent) => {
     event.preventDefault()
     setFormError('')
     if (!validate()) {
       setFormError('Please review the highlighted fields before calculating.')
       return
     }
-    onSave({
+    setSaving(true)
+    try {
+      const saved = await onSave({
       productName: values.productName.trim(), customerName: values.customerName.trim(),
       quantity: Number(values.quantity), sellingPrice: Number(values.sellingPrice),
       costPerUnit: Number(values.costPerUnit), additionalProductExpenses: Number(values.additionalProductExpenses),
       additionalCustomerExpenses: Number(values.additionalCustomerExpenses), sharedExpenses: Number(values.sharedExpenses),
-    })
+      })
+      if (!saved) {
+        setFormError('The analysis was not confirmed as saved. Your draft has been kept so you can retry.')
+        return
+      }
+      if (!clearAnalysisDraft(sessionStorage)) {
+        setFormError('Analysis saved, but this tab could not clear the saved draft.')
+      }
+    } catch (error: unknown) {
+      setFormError(error instanceof Error ? error.message : 'Could not save this analysis.')
+    } finally {
+      setSaving(false)
+    }
   }
-  const clear = () => { setValues(EMPTY_FORM); setErrors({}); setFormError('') }
+  const clear = () => {
+    if (!window.confirm('Reset all entered analysis details and clear this saved draft?')) return
+    if (!clearAnalysisDraft(sessionStorage)) {
+      setFormError('The draft could not be cleared from this tab. Your entered values were kept.')
+      return
+    }
+    setValues(EMPTY_FORM)
+    setErrors({})
+    setFormError('')
+  }
+  const cancel = () => {
+    const hasDraft = Object.values(values).some((value) => value !== '')
+    if (hasDraft && !window.confirm('Cancel this analysis and discard the saved draft?')) return
+    if (!clearAnalysisDraft(sessionStorage)) {
+      setFormError('The draft could not be cleared from this tab. Your entered values were kept.')
+      return
+    }
+    onCancel()
+  }
   const currencySymbol = (() => {
     try { return new Intl.NumberFormat(undefined, { style: 'currency', currency }).formatToParts(0).find((part) => part.type === 'currency')?.value ?? currency } catch { return currency }
   })()
@@ -716,7 +1396,7 @@ function NewAnalysis({ currency, onSave, onCancel }: {
         <h2 className="form-section-title">Product & sale details</h2>
         <div className="field-grid three">
           <FormField label="Product or service" required error={errors.productName}><input value={values.productName} aria-invalid={!!errors.productName} onChange={(e) => set('productName', e.target.value)} placeholder="e.g. Handmade candle" /></FormField>
-          <FormField label="Quantity sold" required error={errors.quantity}><input type="number" min="1" step="1" value={values.quantity} aria-invalid={!!errors.quantity} onChange={(e) => set('quantity', e.target.value)} placeholder="0" /></FormField>
+          <FormField label="Quantity sold" required error={errors.quantity}><input type="number" min="0" step="any" value={values.quantity} aria-invalid={!!errors.quantity} onChange={(e) => set('quantity', e.target.value)} placeholder="0" /></FormField>
           <FormField label={`Selling price per unit (${currency})`} required error={errors.sellingPrice}><MoneyInput currencySymbol={currencySymbol} value={values.sellingPrice} onChange={(v) => set('sellingPrice', v)} error={!!errors.sellingPrice} /></FormField>
           <FormField label={`Cost per unit (${currency})`} required error={errors.costPerUnit}><MoneyInput currencySymbol={currencySymbol} value={values.costPerUnit} onChange={(v) => set('costPerUnit', v)} error={!!errors.costPerUnit} /></FormField>
           <FormField label="Customer name"><input value={values.customerName} onChange={(e) => set('customerName', e.target.value)} placeholder="Optional" /></FormField>
@@ -730,7 +1410,7 @@ function NewAnalysis({ currency, onSave, onCancel }: {
           <FormField label={`Allocated shared expenses (${currency})`} error={errors.sharedExpenses}><MoneyInput currencySymbol={currencySymbol} value={values.sharedExpenses} onChange={(v) => set('sharedExpenses', v)} error={!!errors.sharedExpenses} /></FormField>
         </div>
       </section>
-      <div className="form-actions"><button type="button" className="btn btn-outline" onClick={clear}>Clear form</button><button type="button" className="btn btn-outline" onClick={onCancel}>Cancel</button><button type="submit" className="btn btn-primary"><BarChart3 />Calculate profitability</button></div>
+      <div className="form-actions"><button type="button" className="btn btn-outline" onClick={clear} disabled={saving}>Reset</button><button type="button" className="btn btn-outline" onClick={cancel} disabled={saving}>Cancel</button><button type="submit" className="btn btn-primary" disabled={saving}>{saving ? 'Saving…' : <><BarChart3 />Calculate profitability</>}</button></div>
     </form>
   </>
 }
@@ -805,8 +1485,9 @@ function MissingResult({ onHistory }: { onHistory: () => void }) {
   return <div className="card table-empty" style={{ marginTop: 60 }}><Package /><strong>Analysis not found</strong><p>It may have been removed from your saved history.</p><button className="btn btn-primary" onClick={onHistory}>Go to analysis history</button></div>
 }
 
-function History({ analyses, currency, onView, onDelete, onNew }: {
-  analyses: Analysis[]; currency: string; onView: (analysis: Analysis) => void; onDelete: (id: string) => void; onNew: () => void
+function History({ analyses, currency, localOnlyIds, onView, onDelete, onNew }: {
+  analyses: Analysis[]; currency: string; localOnlyIds: ReadonlySet<string>
+  onView: (analysis: Analysis) => void; onDelete: (id: string) => void; onNew: () => void
 }) {
   const [query, setQuery] = useState('')
   const filtered = analyses.filter((item) => `${item.productName} ${item.customerName}`.toLowerCase().includes(query.toLowerCase()))
@@ -817,7 +1498,7 @@ function History({ analyses, currency, onView, onDelete, onNew }: {
       <div className="section-header"><div><h2 className="card-title">Saved calculations</h2><p className="card-subtitle">Open a result or remove a record from this browser.</p></div>
         <input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="Search analyses" placeholder="Search product or customer" style={{ width: 220, height: 35, padding: '0 10px', border: '1px solid #e1e6e9', borderRadius: 7, fontSize: 11 }} />
       </div>
-      {filtered.length ? <AnalysisTable analyses={filtered} currency={currency} onView={onView} onDelete={onDelete} /> :
+      {filtered.length ? <AnalysisTable analyses={filtered} currency={currency} localOnlyIds={localOnlyIds} onView={onView} onDelete={onDelete} /> :
         <div className="table-empty"><Package /><strong>{analyses.length ? 'No matching analyses' : 'No saved analyses yet'}</strong><p>{analyses.length ? 'Try a different product or customer name.' : 'Your completed calculations will appear here.'}</p>{!analyses.length && <button className="btn btn-primary" onClick={onNew}><Plus />Create first analysis</button>}</div>}
     </div>
   </>
@@ -858,12 +1539,14 @@ function Reports({ analyses, currency }: { analyses: Analysis[]; currency: strin
   </>
 }
 
-function SettingsPage({ profile, darkMode, onSave, onAvatarSave, onToggleTheme, onClear }: {
-  profile: Profile; darkMode: boolean; onSave: (profile: Profile) => void; onAvatarSave: (avatar: string) => void
+function SettingsPage({ profile, darkMode, emailReadOnly, onSave, onAvatarSave, onToggleTheme, onClear }: {
+  profile: Profile; darkMode: boolean; emailReadOnly: boolean
+  onSave: (profile: Profile) => Promise<void>; onAvatarSave: (avatar: string) => void
   onToggleTheme: () => void; onClear: () => void
 }) {
   const [values, setValues] = useState(profile)
   const [error, setError] = useState('')
+  const [saving, setSaving] = useState(false)
   const [cropSource, setCropSource] = useState<string | null>(null)
   const [cropZoom, setCropZoom] = useState(CIRCULAR_CROP_MIN_ZOOM)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -890,10 +1573,10 @@ function SettingsPage({ profile, darkMode, onSave, onAvatarSave, onToggleTheme, 
     reader.onerror = () => setError('The selected image could not be read. Please choose another file.')
     reader.readAsDataURL(file)
   }
-  const submit = (event: FormEvent) => {
+  const submit = async (event: FormEvent) => {
     event.preventDefault()
-    if (!values.fullName.trim() || !values.email.trim() || !values.businessName.trim() || !values.businessType) {
-      setError('Name, email, business name, and business type are required.')
+    if (!values.fullName.trim() || !values.email.trim()) {
+      setError('Name and email are required.')
       return
     }
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(values.email)) {
@@ -916,17 +1599,24 @@ function SettingsPage({ profile, darkMode, onSave, onAvatarSave, onToggleTheme, 
       }
     }
     setError('')
-    onSave({
-      ...values,
-      fullName: values.fullName.trim(),
-      email: values.email.trim(),
-      businessName: values.businessName.trim(),
-      jobTitle: values.jobTitle?.trim() ?? '',
-      phoneNumber: values.phoneNumber?.trim() ?? '',
-      businessWebsite,
-      businessLocation: values.businessLocation?.trim() ?? '',
-      businessDescription: values.businessDescription?.trim() ?? '',
-    })
+    setSaving(true)
+    try {
+      await onSave({
+        ...values,
+        fullName: values.fullName.trim(),
+        email: values.email.trim(),
+        businessName: values.businessName.trim(),
+        jobTitle: values.jobTitle?.trim() ?? '',
+        phoneNumber: values.phoneNumber?.trim() ?? '',
+        businessWebsite,
+        businessLocation: values.businessLocation?.trim() ?? '',
+        businessDescription: values.businessDescription?.trim() ?? '',
+      })
+    } catch (saveError: unknown) {
+      setError(saveError instanceof Error ? saveError.message : 'Could not save your profile.')
+    } finally {
+      setSaving(false)
+    }
   }
   return <>
     <PageHeading eyebrow="Preferences" title="Profile & settings" subtitle="Manage your business profile and local app preferences." />
@@ -977,28 +1667,32 @@ function SettingsPage({ profile, darkMode, onSave, onAvatarSave, onToggleTheme, 
         <h3 className="settings-section-label">Your details</h3>
         <div className="field-grid compact">
           <Field label="Full name" required><input value={values.fullName} onChange={(e) => set('fullName', e.target.value)} /></Field>
-          <Field label="Email address" required><input type="email" value={values.email} onChange={(e) => set('email', e.target.value)} /></Field>
+          <Field label="Email address" required><input type="email" value={values.email} readOnly={emailReadOnly} onChange={(e) => set('email', e.target.value)} /></Field>
           <Field label="Job title or role"><input value={values.jobTitle ?? ''} onChange={(e) => set('jobTitle', e.target.value)} placeholder="e.g. Owner" /></Field>
           <Field label="Phone number"><input type="tel" value={values.phoneNumber ?? ''} onChange={(e) => set('phoneNumber', e.target.value)} placeholder="Optional" /></Field>
         </div>
         <h3 className="settings-section-label">Business details</h3>
         <div className="field-grid compact">
-          <Field label="Business name" required><input value={values.businessName} onChange={(e) => set('businessName', e.target.value)} /></Field>
-          <Field label="Business type" required><select value={values.businessType} onChange={(e) => set('businessType', e.target.value)}>{BUSINESS_TYPES.map((type) => <option key={type}>{type}</option>)}</select></Field>
+          <Field label="Business name"><input value={values.businessName} onChange={(e) => set('businessName', e.target.value)} /></Field>
+          <Field label="Business type"><select value={values.businessType} onChange={(e) => set('businessType', e.target.value)}><option value="">Select type</option>{BUSINESS_TYPES.map((type) => <option key={type}>{type}</option>)}</select></Field>
           <Field label="Preferred currency" required><select value={values.currency} onChange={(e) => set('currency', e.target.value)}>{CURRENCIES.map((code) => <option key={code}>{code}</option>)}</select></Field>
           <Field label="Business website"><input type="url" value={values.businessWebsite ?? ''} onChange={(e) => set('businessWebsite', e.target.value)} placeholder="example.com" /></Field>
           <Field label="Business location"><input value={values.businessLocation ?? ''} onChange={(e) => set('businessLocation', e.target.value)} placeholder="City, country" /></Field>
           <Field label="Short business description"><textarea maxLength={240} value={values.businessDescription ?? ''} onChange={(e) => set('businessDescription', e.target.value)} placeholder="What does your business do?" /></Field>
         </div>
-        <div className="form-actions"><button className="btn btn-primary" type="submit">Save changes</button></div>
+        <div className="form-actions"><button className="btn btn-primary" type="submit" disabled={saving}>{saving ? 'Saving…' : 'Save changes'}</button></div>
       </form>
       <div>
         <div className="card card-pad">
           <h2 className="card-title">Preferences</h2>
           <div className="toggle-row"><div className="toggle-copy"><strong>Appearance</strong><small>Choose a comfortable color theme.</small></div><button className={`switch${darkMode ? ' on' : ''}`} role="switch" aria-checked={darkMode} aria-label="Toggle dark mode" onClick={onToggleTheme} /></div>
         </div>
-        <div className="settings-note" style={{ marginTop: 14 }}>Your information and calculations are stored only in this browser's local storage. The demo password is not retained and this app does not provide authentication.</div>
-        <div className="danger-zone"><strong>Clear all my data</strong><p>Remove your profile, settings, and all saved analyses from this browser. This action cannot be undone.</p><button className="btn btn-danger" onClick={onClear}><Trash2 />Clear all data</button></div>
+        <div className="settings-note" style={{ marginTop: 14 }}>{emailReadOnly
+          ? 'Your name, business name, business type, and currency are saved to your Supabase profile. Profile photos and additional contact details remain in this browser because they are not columns in the profiles table.'
+          : 'This local demo profile and its settings are stored in this browser. The demo password is not retained and is not used for authentication.'}</div>
+        <div className="danger-zone"><strong>Clear local data</strong><p>{emailReadOnly
+          ? 'Remove saved analyses and settings from this browser. Your Supabase profile will not be deleted.'
+          : 'Remove your profile, settings, and all saved analyses from this browser. This action cannot be undone.'}</p><button className="btn btn-danger" onClick={onClear}><Trash2 />Clear local data</button></div>
       </div>
     </div>
   </>

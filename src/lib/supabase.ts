@@ -23,7 +23,7 @@ export const supabaseConfigMessage =
 export const supabase = isValidSupabaseUrl(supabaseUrl) && supabaseKey
   ? createClient(supabaseUrl, supabaseKey, {
       auth: {
-        storage: window.sessionStorage,
+        storage: window.localStorage,
         persistSession: true,
         autoRefreshToken: true,
         detectSessionInUrl: true,

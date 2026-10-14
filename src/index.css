@@ -105,6 +105,7 @@ td strong { color: #263347; font-weight: 650; }
 .loss-text { color: #c85550 !important; font-weight: 650; }
 .status-pill { display: inline-flex; padding: 4px 8px; border-radius: 99px; color: #348167; background: #eaf7f0; font-size: 9px; font-weight: 650; }
 .status-pill.loss { color: #b9524e; background: #fff0ef; }
+.analysis-local-only { display: block; margin-top: 3px; color: #a66a21; font-size: 9px; }
 .table-empty { padding: 37px 20px 40px; text-align: center; color: #8995a2; }
 .table-empty svg { width: 27px; height: 27px; display: block; margin: 0 auto 9px; color: #b2c4be; }
 .table-empty strong { display: block; color: #465466; font-size: 12px; }

@@ -5,6 +5,7 @@ import {
   LoaderCircle, Search, ShieldAlert, Upload, X,
 } from 'lucide-react'
 import { supabase, supabaseConfigMessage } from '../lib/supabase'
+import { ANALYSIS_COLUMNS, analysisContentSignature, analysisFromSupabase } from '../lib/analyses'
 import { calculateProfitability, type Analysis, type AnalysisInput } from '../utils/profitability'
 
 type UploadField = keyof AnalysisInput
@@ -185,10 +186,10 @@ function validateRow(row: ImportedRow, headers: string[], mappings: Mappings, ed
     additionalCustomerExpenses: Number(parsed.additionalCustomerExpenses ?? 0),
     sharedExpenses: Number(parsed.sharedExpenses ?? 0),
   }
-  const calculated = calculateProfitability(input)
-  if (![calculated.revenue, calculated.directCost, calculated.totalCost, calculated.profit].every(Number.isFinite)
-    || (calculated.margin !== null && !Number.isFinite(calculated.margin))) {
-    errors.push('The selected values are too large to calculate safely.')
+  try {
+    calculateProfitability(input)
+  } catch (error: unknown) {
+    errors.push(error instanceof Error ? error.message : 'The selected values are too large to calculate safely.')
   }
   if (headers.length === 0) errors.push(`Spreadsheet row ${row.sourceRow} is missing its header mapping.`)
   return { values, errors, warnings, input: errors.length ? null : input }
@@ -236,6 +237,15 @@ async function fileDigest(file: File) {
   const data = await file.arrayBuffer()
   const digest = await crypto.subtle.digest('SHA-256', data)
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+async function stableImportId(value: string) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
+  const bytes = new Uint8Array(digest).slice(0, 16)
+  bytes[6] = (bytes[6] & 0x0f) | 0x50
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
 }
 
 export default function BulkUpload({ currency, onImported }: {
@@ -472,7 +482,8 @@ export default function BulkUpload({ currency, onImported }: {
         return
       }
 
-      const records = calculated.map((record) => ({
+      const records = await Promise.all(calculated.map(async (record) => ({
+        id: await stableImportId(`${user.id}:${sourceFingerprint}:${record.sourceRow}:${signature(record)}`),
         user_id: user.id,
         product_name: record.productName,
         customer_name: record.customerName,
@@ -483,20 +494,45 @@ export default function BulkUpload({ currency, onImported }: {
         additional_customer_expenses: record.additionalCustomerExpenses,
         allocated_shared_expenses: record.sharedExpenses,
         created_at: record.createdAt,
-      }))
+      })))
+      const expectedById = new Map(records.map((record, index) => [
+        record.id,
+        calculated[index],
+      ]))
       for (let offset = 0; offset < records.length; offset += BATCH_SIZE) {
         const batch = records.slice(offset, offset + BATCH_SIZE)
         const { error: databaseError } = await supabase
           .from('analyses')
-          .insert(batch)
+          .upsert(batch, { onConflict: 'id', ignoreDuplicates: true })
         if (databaseError) {
           throw new Error(`Database rejected batch ${Math.floor(offset / BATCH_SIZE) + 1}: ${databaseError.message}`)
         }
-        const batchResults = calculated.slice(offset, offset + batch.length)
-        onImported(batchResults.map((record) => {
-          const { sourceRow: _sourceRow, recommendation: _recommendation, ...analysis } = record
-          return analysis
-        }))
+        const { data: savedRows, error: verifyError } = await supabase
+          .from('analyses')
+          .select(ANALYSIS_COLUMNS)
+          .eq('user_id', user.id)
+          .in('id', batch.map((record) => record.id))
+        if (verifyError) {
+          throw new Error(`Could not verify batch ${Math.floor(offset / BATCH_SIZE) + 1}: ${verifyError.message}`)
+        }
+        if (!savedRows || savedRows.length !== batch.length) {
+          throw new Error(`Supabase did not confirm every row in batch ${Math.floor(offset / BATCH_SIZE) + 1}. Check the database before retrying.`)
+        }
+        const importedRows = savedRows.map((row) => {
+          if (row.user_id !== user.id) {
+            throw new Error('Supabase returned an imported row that does not belong to the signed-in user.')
+          }
+          const remote = analysisFromSupabase(row)
+          const expected = expectedById.get(row.id)
+          if (!expected || analysisContentSignature(remote) !== analysisContentSignature(expected)) {
+            throw new Error(`Import ID ${row.id} already exists with different data. No existing row was overwritten.`)
+          }
+          return remote
+        })
+        if (importedRows.length !== batch.length) {
+          throw new Error(`Supabase confirmed an incomplete response for batch ${Math.floor(offset / BATCH_SIZE) + 1}.`)
+        }
+        onImported(importedRows)
         savedCount += batch.length
         setProgress({ saved: savedCount, total: records.length })
       }
